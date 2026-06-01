@@ -91,31 +91,56 @@ RESULTS=$(mktemp)
 trap 'rm -f "$RESULTS" "${TESTFILE:-}"' EXIT
 record() { printf '%s\t%s\n' "$1" "$2" >> "$RESULTS"; }
 
-# stats: read one number per line on stdin and print a summary.
-#   $1 = printf format for a single number (e.g. "%.0f").
-# With one sample, prints just the value; with several, "mean ± stddev (n=N)".
+# stats: read one number per line on stdin and print a raw "mean stddev n"
+# triple (space-separated). Empty output if there were no samples. The values
+# are kept full-precision here; fmt_stat handles human-facing rounding.
 stats() {
-    awk -v fmt="$1" '
+    awk '
         NF { x[++c]=$1; s+=$1 }
         END {
-            if (c==0) { print "n/a"; exit }
+            if (c==0) { exit }
             m = s/c
-            if (c==1) { printf fmt, m; exit }
+            if (c==1) { printf "%.10g 0 1", m; exit }
             for (i=1; i<=c; i++) { d=x[i]-m; ss+=d*d }
-            printf fmt " ± " fmt " (n=%d)", m, sqrt(ss/(c-1)), c
+            printf "%.10g %.10g %d", m, sqrt(ss/(c-1)), c
         }'
 }
 
-# aggregate: run a measurement command $RUNS times and summarise it via stats.
-#   $1 = printf format, rest = command that prints a single number per run.
+# fmt_stat: format a "mean stddev n" triple for display.
+#   $1 = printf format for one number (e.g. "%.1f"), $2 = the triple.
+# One sample → just the value; several → "mean ± stddev (n=N)".
+fmt_stat() {
+    local fmt="$1" m s n
+    read -r m s n <<<"$2"
+    if [[ -z "$m" ]]; then echo "n/a"; return; fi
+    if (( n <= 1 )); then printf "$fmt" "$m"
+    else printf "$fmt ± $fmt (n=%d)" "$m" "$s" "$n"; fi
+}
+
+# record_stat: persist a "mean stddev n" triple as machine-readable JSON fields.
+# One sample → a single numeric "<key>"; several → "<key>_mean/_stddev/_n".
+record_stat() {
+    local key="$1" m s n
+    read -r m s n <<<"$2"
+    [[ -z "$m" ]] && return
+    if (( n <= 1 )); then
+        record "$key" "$m"
+    else
+        record "${key}_mean"   "$m"
+        record "${key}_stddev" "$s"
+        record "${key}_n"      "$n"
+    fi
+}
+
+# aggregate: run a measurement command $RUNS times and reduce to a stats triple.
+#   args = command that prints a single number per run.
 aggregate() {
-    local fmt="$1"; shift
     local vals="" v
     for ((r=0; r<RUNS; r++)); do
         v=$("$@")
         [[ -n "$v" ]] && vals+="$v"$'\n'
     done
-    printf '%s' "$vals" | stats "$fmt"
+    printf '%s' "$vals" | stats
 }
 
 # Show a "(averaged over N runs)" note once per section when --runs > 1.
@@ -194,26 +219,26 @@ section_cpu() {
         note "tool: sysbench  (single-thread, then ${NTHREADS}-thread)"
         runs_note
         local single multi
-        single=$(aggregate '%.1f' m_cpu_single)
-        multi=$(aggregate '%.1f' m_cpu_multi)
-        row "Single-thread (events/s)" "$single"
-        row "Multi-thread (events/s)"  "$multi"
-        record "cpu_single_eps" "$single"
-        record "cpu_multi_eps" "$multi"
+        single=$(aggregate m_cpu_single)
+        multi=$(aggregate m_cpu_multi)
+        row "Single-thread (events/s)" "$(fmt_stat '%.1f' "$single")"
+        row "Multi-thread (events/s)"  "$(fmt_stat '%.1f' "$multi")"
+        record_stat "cpu_single_eps" "$single"
+        record_stat "cpu_multi_eps" "$multi"
     elif have stress-ng; then
         note "tool: stress-ng  (bogo-ops over ${CPU_DURATION}s)"
         runs_note
         local bogo
-        bogo=$(aggregate '%.1f' m_cpu_bogo)
-        row "Throughput (bogo-ops/s)" "$bogo"
-        record "cpu_bogo_ops" "$bogo"
+        bogo=$(aggregate m_cpu_bogo)
+        row "Throughput (bogo-ops/s)" "$(fmt_stat '%.1f' "$bogo")"
+        record_stat "cpu_bogo_ops" "$bogo"
     elif have python3; then
         note "tool: python fallback  (install 'sysbench' for a real CPU score)"
         runs_note
         local single
-        single=$(aggregate '%.0f' cpu_python_score "$CPU_DURATION")
-        row "Single-thread (primes/s)" "$single"
-        record "cpu_python_primes" "$single"
+        single=$(aggregate cpu_python_score "$CPU_DURATION")
+        row "Single-thread (primes/s)" "$(fmt_stat '%.0f' "$single")"
+        record_stat "cpu_python_primes" "$single"
     else
         note "no CPU benchmark tool available (install sysbench or stress-ng)"
     fi
@@ -250,16 +275,16 @@ section_mem() {
         note "tool: sysbench  (sequential write, 1 KiB blocks)"
         runs_note
         local bw
-        bw=$(aggregate '%.1f' m_mem_sysbench)
-        row "Throughput (MiB/s)" "$bw"
-        record "mem_throughput_mibps" "$bw"
+        bw=$(aggregate m_mem_sysbench)
+        row "Throughput (MiB/s)" "$(fmt_stat '%.1f' "$bw")"
+        record_stat "mem_throughput_mibps" "$bw"
     else
         note "tool: python fallback  (install 'sysbench' for a real memory score)"
         runs_note
         local bw
-        bw=$(aggregate '%.2f' m_mem_python)
-        row "memcpy bandwidth (GiB/s)" "$bw"
-        record "mem_memcpy_gibps" "$bw"
+        bw=$(aggregate m_mem_python)
+        row "memcpy bandwidth (GiB/s)" "$(fmt_stat '%.2f' "$bw")"
+        record_stat "mem_memcpy_gibps" "$bw"
     fi
 }
 
@@ -291,12 +316,12 @@ section_disk() {
             [[ -n "$wkb" ]] && writes+="$(awk "BEGIN{print ${wkb:-0}/1024}")"$'\n'
         done
         local rd wr
-        rd=$(printf '%s' "$reads"  | stats '%.1f')
-        wr=$(printf '%s' "$writes" | stats '%.1f')
-        row "Random read (MB/s)"  "$rd"
-        row "Random write (MB/s)" "$wr"
-        record "disk_rand_read_mbps" "$rd"
-        record "disk_rand_write_mbps" "$wr"
+        rd=$(printf '%s' "$reads"  | stats)
+        wr=$(printf '%s' "$writes" | stats)
+        row "Random read (MB/s)"  "$(fmt_stat '%.1f' "$rd")"
+        row "Random write (MB/s)" "$(fmt_stat '%.1f' "$wr")"
+        record_stat "disk_rand_read_mbps" "$rd"
+        record_stat "disk_rand_write_mbps" "$wr"
     else
         note "tool: dd fallback  (sequential, install 'fio' for random IOPS)"
         (( RUNS > 1 )) && note "(--runs averaging needs fio; running the dd fallback once)"
@@ -355,9 +380,9 @@ section_gpu() {
             local r
             for ((r=1; r<RUNS; r++)); do vals+="$(m_gpu_fp16)"$'\n'; done
             local tflops
-            tflops=$(printf '%s' "$vals" | stats '%.1f')
-            row "FP16 matmul (TFLOP/s)" "$tflops"
-            record "gpu_fp16_tflops" "$tflops"
+            tflops=$(printf '%s' "$vals" | stats)
+            row "FP16 matmul (TFLOP/s)" "$(fmt_stat '%.1f' "$tflops")"
+            record_stat "gpu_fp16_tflops" "$tflops"
         fi
     else
         note "install PyTorch (torch) for a compute throughput number"
@@ -411,12 +436,12 @@ section_net() {
     note "tool: iperf3  (TCP throughput to ${IPERF_HOST})"
     runs_note
     local up down
-    up=$(aggregate '%.1f' m_net "")
-    down=$(aggregate '%.1f' m_net "-R")
-    row "Uplink (send) Mbit/s"    "$up"
-    row "Downlink (recv) Mbit/s"  "$down"
-    record "net_up_mbps" "$up"
-    record "net_down_mbps" "$down"
+    up=$(aggregate m_net "")
+    down=$(aggregate m_net "-R")
+    row "Uplink (send) Mbit/s"    "$(fmt_stat '%.1f' "$up")"
+    row "Downlink (recv) Mbit/s"  "$(fmt_stat '%.1f' "$down")"
+    record_stat "net_up_mbps" "$up"
+    record_stat "net_down_mbps" "$down"
 }
 
 # ----------------------------------------------------------------------------
@@ -432,8 +457,13 @@ write_json() {
             [[ -z "$k" ]] && continue
             (( first )) || echo ","
             first=0
-            v=${v//\"/\\\"}
-            printf '  "%s": "%s"' "$k" "$v"
+            # Emit plain numbers unquoted; everything else as a JSON string.
+            if [[ "$v" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                printf '  "%s": %s' "$k" "$v"
+            else
+                v=${v//\"/\\\"}
+                printf '  "%s": "%s"' "$k" "$v"
+            fi
         done < "$RESULTS"
         echo ""
         echo "}"
