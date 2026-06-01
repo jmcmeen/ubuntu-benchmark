@@ -90,19 +90,31 @@ full run instead.
 With `--json out.json`, results are also written as a flat JSON object with a
 timestamp — handy for logging runs or feeding a dashboard:
 
+Numeric metrics are emitted as unquoted JSON numbers; descriptive fields stay
+strings. A single run records one value per metric:
+
 ```json
 {
   "timestamp": "2026-06-01T18:58:00-04:00",
   "cpu_model": "...",
-  "cpu_single_eps": "...",
-  "disk_rand_read_mbps": "...",
-  "gpu_fp16_tflops": "...",
-  "net_down_mbps": "..."
+  "cpu_single_eps": 1163.45,
+  "disk_rand_read_mbps": 34.03,
+  "gpu_fp16_tflops": 312.0,
+  "net_down_mbps": 941.0
 }
 ```
 
-When `--runs > 1`, the recorded values are the formatted summary string
-(`"mean ± stddev (n=N)"`) rather than a bare number.
+With `--runs N` (N > 1), each averaged metric is split into `_mean`, `_stddev`,
+and `_n` fields so the result stays machine-readable:
+
+```json
+{
+  "timestamp": "2026-06-01T18:58:00-04:00",
+  "cpu_single_eps_mean": 1176.9,
+  "cpu_single_eps_stddev": 31.11,
+  "cpu_single_eps_n": 3
+}
+```
 
 ## Notes
 
