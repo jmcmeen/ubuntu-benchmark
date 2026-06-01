@@ -8,11 +8,13 @@
 # root, though disk tests are more accurate if you can drop caches (sudo).
 #
 # Usage:
-#   ./sysbench.sh                 # run everything available
-#   ./sysbench.sh --cpu --mem     # run only selected sections
-#   ./sysbench.sh --no-gpu        # skip the GPU section
-#   ./sysbench.sh --dir /data     # run disk test in a specific directory
-#   ./sysbench.sh --json out.json # also write machine-readable results
+#   ./sysbench.sh                    # run everything available
+#   ./sysbench.sh --cpu --mem        # run only selected sections
+#   ./sysbench.sh --no-gpu           # skip the GPU section
+#   ./sysbench.sh --dir /data        # run disk test in a specific directory
+#   ./sysbench.sh --runs 5           # repeat each test, report mean ± stddev
+#   ./sysbench.sh --iperf-host HOST  # network test against an 'iperf3 -s' server
+#   ./sysbench.sh --json out.json    # also write machine-readable results
 #   ./sysbench.sh --help
 #
 set -uo pipefail
@@ -21,11 +23,15 @@ set -uo pipefail
 # Configuration & argument parsing
 # ----------------------------------------------------------------------------
 RUN_INFO=1 RUN_CPU=1 RUN_MEM=1 RUN_DISK=1 RUN_GPU=1
+RUN_NET=0                  # network test is opt-in (it needs a remote target)
 ONLY_SELECTED=0
 DISK_DIR="."
 JSON_OUT=""
 DISK_SIZE_MB=1024          # size of the test file for disk I/O
 CPU_DURATION=10            # seconds per CPU sub-test
+NET_DURATION=10            # seconds per iperf3 direction
+RUNS=1                     # repeat each measurement this many times
+IPERF_HOST=""              # remote 'iperf3 -s' server for the network test
 
 usage() {
     sed -n '2,/^set /p' "$0" | sed 's/^#\s\?//; /^set /d'
@@ -35,10 +41,10 @@ usage() {
 # If any --<section> flag is passed, run *only* those sections.
 for arg in "$@"; do
     case "$arg" in
-        --cpu|--mem|--disk|--gpu|--info) ONLY_SELECTED=1 ;;
+        --cpu|--mem|--disk|--gpu|--info|--net|--iperf-host) ONLY_SELECTED=1 ;;
     esac
 done
-if (( ONLY_SELECTED )); then RUN_INFO=0 RUN_CPU=0 RUN_MEM=0 RUN_DISK=0 RUN_GPU=0; fi
+if (( ONLY_SELECTED )); then RUN_INFO=0 RUN_CPU=0 RUN_MEM=0 RUN_DISK=0 RUN_GPU=0 RUN_NET=0; fi
 
 while (( $# )); do
     case "$1" in
@@ -47,16 +53,24 @@ while (( $# )); do
         --mem)   RUN_MEM=1 ;;
         --disk)  RUN_DISK=1 ;;
         --gpu)   RUN_GPU=1 ;;
+        --net)   RUN_NET=1 ;;
         --no-gpu)  RUN_GPU=0 ;;
         --no-disk) RUN_DISK=0 ;;
         --dir)   DISK_DIR="${2:?--dir needs a path}"; shift ;;
         --size)  DISK_SIZE_MB="${2:?--size needs MB}"; shift ;;
+        --runs)  RUNS="${2:?--runs needs a count}"; shift ;;
+        --iperf-host) IPERF_HOST="${2:?--iperf-host needs a host}"; RUN_NET=1; shift ;;
         --json)  JSON_OUT="${2:?--json needs a file}"; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
 done
+
+# Validate --runs: must be a positive integer.
+if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--runs must be a positive integer (got '$RUNS')" >&2; exit 2
+fi
 
 # ----------------------------------------------------------------------------
 # Pretty output helpers
@@ -76,6 +90,36 @@ have()   { command -v "$1" >/dev/null 2>&1; }
 RESULTS=$(mktemp)
 trap 'rm -f "$RESULTS" "${TESTFILE:-}"' EXIT
 record() { printf '%s\t%s\n' "$1" "$2" >> "$RESULTS"; }
+
+# stats: read one number per line on stdin and print a summary.
+#   $1 = printf format for a single number (e.g. "%.0f").
+# With one sample, prints just the value; with several, "mean ± stddev (n=N)".
+stats() {
+    awk -v fmt="$1" '
+        NF { x[++c]=$1; s+=$1 }
+        END {
+            if (c==0) { print "n/a"; exit }
+            m = s/c
+            if (c==1) { printf fmt, m; exit }
+            for (i=1; i<=c; i++) { d=x[i]-m; ss+=d*d }
+            printf fmt " ± " fmt " (n=%d)", m, sqrt(ss/(c-1)), c
+        }'
+}
+
+# aggregate: run a measurement command $RUNS times and summarise it via stats.
+#   $1 = printf format, rest = command that prints a single number per run.
+aggregate() {
+    local fmt="$1"; shift
+    local vals="" v
+    for ((r=0; r<RUNS; r++)); do
+        v=$("$@")
+        [[ -n "$v" ]] && vals+="$v"$'\n'
+    done
+    printf '%s' "$vals" | stats "$fmt"
+}
+
+# Show a "(averaged over N runs)" note once per section when --runs > 1.
+runs_note() { (( RUNS > 1 )) && note "averaging over $RUNS runs"; }
 
 # ----------------------------------------------------------------------------
 # System information
@@ -129,34 +173,47 @@ print(f"{ops/budget:.0f}")
 PY
 }
 
+NTHREADS=$(nproc 2>/dev/null || echo 1)
+
+m_cpu_single() {
+    sysbench cpu --cpu-max-prime=20000 --threads=1 --time="$CPU_DURATION" run 2>/dev/null \
+        | awk '/events per second/{print $NF}'
+}
+m_cpu_multi() {
+    sysbench cpu --cpu-max-prime=20000 --threads="$NTHREADS" --time="$CPU_DURATION" run 2>/dev/null \
+        | awk '/events per second/{print $NF}'
+}
+m_cpu_bogo() {
+    stress-ng --cpu "$NTHREADS" --cpu-method all --metrics-brief \
+        --timeout "${CPU_DURATION}s" 2>&1 | awk '/cpu /{print $5; exit}'
+}
+
 section_cpu() {
     header "CPU"
     if have sysbench; then
-        local nthreads; nthreads=$(nproc)
-        note "tool: sysbench  (single-thread, then ${nthreads}-thread)"
+        note "tool: sysbench  (single-thread, then ${NTHREADS}-thread)"
+        runs_note
         local single multi
-        single=$(sysbench cpu --cpu-max-prime=20000 --threads=1 --time="$CPU_DURATION" run 2>/dev/null \
-                 | awk '/events per second/{print $NF}')
-        multi=$(sysbench cpu --cpu-max-prime=20000 --threads="$nthreads" --time="$CPU_DURATION" run 2>/dev/null \
-                 | awk '/events per second/{print $NF}')
-        row "Single-thread (events/s)" "${single:-n/a}"
-        row "Multi-thread (events/s)"  "${multi:-n/a}"
-        record "cpu_single_eps" "${single:-}"
-        record "cpu_multi_eps" "${multi:-}"
+        single=$(aggregate '%.1f' m_cpu_single)
+        multi=$(aggregate '%.1f' m_cpu_multi)
+        row "Single-thread (events/s)" "$single"
+        row "Multi-thread (events/s)"  "$multi"
+        record "cpu_single_eps" "$single"
+        record "cpu_multi_eps" "$multi"
     elif have stress-ng; then
-        local nthreads; nthreads=$(nproc)
         note "tool: stress-ng  (bogo-ops over ${CPU_DURATION}s)"
+        runs_note
         local bogo
-        bogo=$(stress-ng --cpu "$nthreads" --cpu-method all --metrics-brief \
-                 --timeout "${CPU_DURATION}s" 2>&1 | awk '/cpu /{print $5; exit}')
-        row "Throughput (bogo-ops/s)" "${bogo:-n/a}"
-        record "cpu_bogo_ops" "${bogo:-}"
+        bogo=$(aggregate '%.1f' m_cpu_bogo)
+        row "Throughput (bogo-ops/s)" "$bogo"
+        record "cpu_bogo_ops" "$bogo"
     elif have python3; then
         note "tool: python fallback  (install 'sysbench' for a real CPU score)"
+        runs_note
         local single
-        single=$(cpu_python_score "$CPU_DURATION")
-        row "Single-thread (primes/s)" "${single:-n/a}"
-        record "cpu_python_primes" "${single:-}"
+        single=$(aggregate '%.0f' cpu_python_score "$CPU_DURATION")
+        row "Single-thread (primes/s)" "$single"
+        record "cpu_python_primes" "$single"
     else
         note "no CPU benchmark tool available (install sysbench or stress-ng)"
     fi
@@ -165,20 +222,15 @@ section_cpu() {
 # ----------------------------------------------------------------------------
 # Memory benchmark
 # ----------------------------------------------------------------------------
-section_mem() {
-    header "Memory"
-    if have sysbench; then
-        note "tool: sysbench  (sequential write, 1 KiB blocks)"
-        local bw
-        bw=$(sysbench memory --memory-block-size=1K --memory-total-size=10G \
-               --memory-oper=write run 2>/dev/null \
-               | awk '/transferred/{gsub(/[()]/,""); print $(NF-1), $NF}')
-        row "Throughput" "${bw:-n/a}"
-        record "mem_throughput" "${bw:-}"
-    else
-        note "tool: python fallback  (install 'sysbench' for a real memory score)"
-        local bw
-        bw=$(python3 - <<'PY'
+# sysbench memory: print just the numeric MiB/sec throughput.
+m_mem_sysbench() {
+    sysbench memory --memory-block-size=1K --memory-total-size=10G \
+        --memory-oper=write run 2>/dev/null \
+        | awk '/transferred/{gsub(/[()]/,""); print $(NF-1)}'
+}
+# Pure-python memcpy fallback: print bandwidth in GiB/s as a bare number.
+m_mem_python() {
+    python3 - <<'PY'
 import time
 size = 256 * 1024 * 1024          # 256 MiB buffer
 src = bytearray(size)
@@ -188,12 +240,26 @@ dst = bytearray(size)
 for _ in range(reps):
     dst[:] = src                  # large memcpy
 elapsed = time.perf_counter() - start
-gbps = (size * reps) / elapsed / (1024**3)
-print(f"{gbps:.2f} GiB/s")
+print(f"{(size * reps) / elapsed / (1024**3):.2f}")
 PY
-)
-        row "memcpy bandwidth" "${bw:-n/a}"
-        record "mem_memcpy" "${bw:-}"
+}
+
+section_mem() {
+    header "Memory"
+    if have sysbench; then
+        note "tool: sysbench  (sequential write, 1 KiB blocks)"
+        runs_note
+        local bw
+        bw=$(aggregate '%.1f' m_mem_sysbench)
+        row "Throughput (MiB/s)" "$bw"
+        record "mem_throughput_mibps" "$bw"
+    else
+        note "tool: python fallback  (install 'sysbench' for a real memory score)"
+        runs_note
+        local bw
+        bw=$(aggregate '%.2f' m_mem_python)
+        row "memcpy bandwidth (GiB/s)" "$bw"
+        record "mem_memcpy_gibps" "$bw"
     fi
 }
 
@@ -209,23 +275,31 @@ section_disk() {
 
     if have fio; then
         note "tool: fio  (4 KiB random read/write, direct I/O)"
-        local tmp; tmp=$(mktemp -p "$DISK_DIR" fio.XXXXXX)
-        local out
-        out=$(fio --name=rw --filename="$tmp" --size="${DISK_SIZE_MB}M" \
-                  --bs=4k --rw=randrw --rwmixread=70 --direct=1 \
-                  --ioengine=libaio --iodepth=16 --runtime=10 --time_based \
-                  --group_reporting --minimal 2>/dev/null)
-        rm -f "$tmp"
-        # minimal format: read BW is field 7 (KB/s), write BW field 48.
-        local rkb wkb
-        rkb=$(echo "$out" | awk -F';' '{print $7}')
-        wkb=$(echo "$out" | awk -F';' '{print $48}')
-        row "Random read"  "$(awk "BEGIN{printf \"%.1f MB/s\", ${rkb:-0}/1024}")"
-        row "Random write" "$(awk "BEGIN{printf \"%.1f MB/s\", ${wkb:-0}/1024}")"
-        record "disk_rand_read_kbps" "${rkb:-}"
-        record "disk_rand_write_kbps" "${wkb:-}"
+        runs_note
+        local reads="" writes="" tmp out rkb wkb
+        for ((r=0; r<RUNS; r++)); do
+            tmp=$(mktemp -p "$DISK_DIR" fio.XXXXXX)
+            out=$(fio --name=rw --filename="$tmp" --size="${DISK_SIZE_MB}M" \
+                      --bs=4k --rw=randrw --rwmixread=70 --direct=1 \
+                      --ioengine=libaio --iodepth=16 --runtime=10 --time_based \
+                      --group_reporting --minimal 2>/dev/null)
+            rm -f "$tmp"
+            # minimal format: read BW is field 7 (KB/s), write BW field 48.
+            rkb=$(echo "$out" | awk -F';' '{print $7}')
+            wkb=$(echo "$out" | awk -F';' '{print $48}')
+            [[ -n "$rkb" ]] && reads+="$(awk "BEGIN{print ${rkb:-0}/1024}")"$'\n'
+            [[ -n "$wkb" ]] && writes+="$(awk "BEGIN{print ${wkb:-0}/1024}")"$'\n'
+        done
+        local rd wr
+        rd=$(printf '%s' "$reads"  | stats '%.1f')
+        wr=$(printf '%s' "$writes" | stats '%.1f')
+        row "Random read (MB/s)"  "$rd"
+        row "Random write (MB/s)" "$wr"
+        record "disk_rand_read_mbps" "$rd"
+        record "disk_rand_write_mbps" "$wr"
     else
         note "tool: dd fallback  (sequential, install 'fio' for random IOPS)"
+        (( RUNS > 1 )) && note "(--runs averaging needs fio; running the dd fallback once)"
         TESTFILE="$DISK_DIR/.sysbench_dd_$$"
         # Sequential write.
         local w_line w_speed
@@ -271,8 +345,28 @@ section_gpu() {
     # Compute throughput via PyTorch if present (great proxy on Blackwell cards).
     if python3 -c 'import torch' 2>/dev/null; then
         note "running a quick FP16 matmul throughput test via PyTorch…"
-        local tflops
-        tflops=$(python3 - <<'PY'
+        runs_note
+        local first vals
+        first=$(m_gpu_fp16)
+        if [[ "$first" == "cuda-unavailable" ]]; then
+            note "PyTorch present but CUDA not available to it"
+        else
+            vals="$first"$'\n'
+            local r
+            for ((r=1; r<RUNS; r++)); do vals+="$(m_gpu_fp16)"$'\n'; done
+            local tflops
+            tflops=$(printf '%s' "$vals" | stats '%.1f')
+            row "FP16 matmul (TFLOP/s)" "$tflops"
+            record "gpu_fp16_tflops" "$tflops"
+        fi
+    else
+        note "install PyTorch (torch) for a compute throughput number"
+    fi
+}
+
+# One FP16 matmul throughput sample in TFLOP/s (or the sentinel "cuda-unavailable").
+m_gpu_fp16() {
+    python3 - <<'PY'
 import torch, time
 if not torch.cuda.is_available():
     print("cuda-unavailable"); raise SystemExit
@@ -292,16 +386,37 @@ dt = time.perf_counter() - t0
 flops = 2 * n**3 * iters
 print(f"{flops/dt/1e12:.1f}")
 PY
-)
-        if [[ "$tflops" == "cuda-unavailable" ]]; then
-            note "PyTorch present but CUDA not available to it"
-        else
-            row "FP16 matmul" "${tflops:-n/a} TFLOP/s"
-            record "gpu_fp16_tflops" "${tflops:-}"
-        fi
-    else
-        note "install PyTorch (torch) for a compute throughput number"
+}
+
+# ----------------------------------------------------------------------------
+# Network benchmark (iperf3)
+# ----------------------------------------------------------------------------
+# One iperf3 run; $1 = extra flags ("" for uplink, "-R" for downlink). Prints
+# the receiver-side throughput in Mbit/s as a bare number.
+m_net() {
+    iperf3 -c "$IPERF_HOST" -t "$NET_DURATION" -f m $1 2>/dev/null \
+        | awk '/receiver/{ for(i=1;i<=NF;i++) if($i=="Mbits/sec") print $(i-1) }'
+}
+
+section_net() {
+    header "Network"
+    if ! have iperf3; then
+        note "iperf3 not installed (sudo apt install iperf3) — skipping"
+        return
     fi
+    if [[ -z "$IPERF_HOST" ]]; then
+        note "no target given — pass --iperf-host HOST (with 'iperf3 -s' running there)"
+        return
+    fi
+    note "tool: iperf3  (TCP throughput to ${IPERF_HOST})"
+    runs_note
+    local up down
+    up=$(aggregate '%.1f' m_net "")
+    down=$(aggregate '%.1f' m_net "-R")
+    row "Uplink (send) Mbit/s"    "$up"
+    row "Downlink (recv) Mbit/s"  "$down"
+    record "net_up_mbps" "$up"
+    record "net_down_mbps" "$down"
 }
 
 # ----------------------------------------------------------------------------
@@ -337,6 +452,7 @@ printf '%s%sUbuntu System Benchmark%s  %s%s%s\n' \
 (( RUN_MEM  )) && section_mem
 (( RUN_DISK )) && section_disk
 (( RUN_GPU  )) && section_gpu
+(( RUN_NET  )) && section_net
 
 write_json
 header "Done"
