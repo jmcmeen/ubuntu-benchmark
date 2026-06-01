@@ -41,12 +41,14 @@ sudo apt install sysbench fio
 ## Usage
 
 ```bash
-./sysbench.sh                 # run everything available
-./sysbench.sh --cpu --mem     # run only the selected sections
-./sysbench.sh --no-gpu        # run everything except the GPU section
-./sysbench.sh --dir /data     # run the disk test in a specific directory
-./sysbench.sh --size 4096     # disk test file size in MB (default 1024)
-./sysbench.sh --json out.json # also write machine-readable results
+./sysbench.sh                       # run everything available
+./sysbench.sh --cpu --mem           # run only the selected sections
+./sysbench.sh --no-gpu              # run everything except the GPU section
+./sysbench.sh --dir /data           # run the disk test in a specific directory
+./sysbench.sh --size 4096           # disk test file size in MB (default 1024)
+./sysbench.sh --runs 5              # repeat each test, report mean ± stddev
+./sysbench.sh --iperf-host 10.0.0.2 # network throughput test (needs iperf3 -s there)
+./sysbench.sh --json out.json       # also write machine-readable results
 ./sysbench.sh --help
 ```
 
@@ -56,28 +58,32 @@ full run instead.
 
 ### Flags
 
-| Flag             | Effect                                                        |
-| ---------------- | ------------------------------------------------------------- |
-| `--info`         | System info section (host, kernel, distro, CPU, RAM, GPU)     |
-| `--cpu`          | CPU benchmark                                                 |
-| `--mem`          | Memory throughput benchmark                                   |
-| `--disk`         | Disk I/O benchmark                                            |
-| `--gpu`          | GPU section (NVIDIA only)                                     |
-| `--no-gpu`       | Skip the GPU section                                          |
-| `--no-disk`      | Skip the disk section                                         |
-| `--dir PATH`     | Directory for the disk test file (default: current dir)       |
-| `--size MB`      | Size of the disk test file in MB (default: 1024)              |
-| `--json FILE`    | Also write results as JSON to `FILE`                          |
-| `-h`, `--help`   | Show usage                                                    |
+| Flag             | Effect                                                      |
+| ---------------- | ----------------------------------------------------------- |
+| `--info`         | System info section (host, kernel, distro, CPU, RAM, GPU)   |
+| `--cpu`          | CPU benchmark                                               |
+| `--mem`          | Memory throughput benchmark                                 |
+| `--disk`         | Disk I/O benchmark                                          |
+| `--gpu`          | GPU section (NVIDIA only)                                   |
+| `--net`          | Network section (needs `--iperf-host`)                      |
+| `--no-gpu`       | Skip the GPU section                                        |
+| `--no-disk`      | Skip the disk section                                       |
+| `--dir PATH`     | Directory for the disk test file (default: current dir)     |
+| `--size MB`      | Size of the disk test file in MB (default: 1024)            |
+| `--runs N`       | Repeat each test N times; report mean ± stddev (default: 1) |
+| `--iperf-host H` | Run the network test against `iperf3 -s` on host `H`        |
+| `--json FILE`    | Also write results as JSON to `FILE`                        |
+| `-h`, `--help`   | Show usage                                                  |
 
 ## What each section measures
 
-| Section    | Preferred tool        | Fallback                          | Reported                                  |
-| ---------- | --------------------- | --------------------------------- | ----------------------------------------- |
-| **CPU**    | `sysbench` (1 + N thr)| `stress-ng`, then Python primes   | events/s (or bogo-ops/s, or primes/s)     |
-| **Memory** | `sysbench`            | Python `memcpy` loop              | throughput / bandwidth                    |
-| **Disk**   | `fio` (4K randrw)     | `dd` (sequential)                 | random R/W MB/s (or sequential R/W)       |
-| **GPU**    | `nvidia-smi` + PyTorch| — (NVIDIA-only, skipped otherwise)| name, VRAM, driver, temp/util, FP16 TFLOP/s |
+| Section     | Preferred tool         | Fallback                           | Reported                                    |
+| ----------- | ---------------------- | ---------------------------------- | ------------------------------------------- |
+| **CPU**     | `sysbench` (1 + N thr) | `stress-ng`, then Python primes    | events/s (or bogo-ops/s, or primes/s)       |
+| **Memory**  | `sysbench`             | Python `memcpy` loop               | throughput (MiB/s) / bandwidth (GiB/s)      |
+| **Disk**    | `fio` (4K randrw)      | `dd` (sequential)                  | random R/W MB/s (or sequential R/W)         |
+| **GPU**     | `nvidia-smi` + PyTorch | — (NVIDIA-only, skipped otherwise) | name, VRAM, driver, temp/util, FP16 TFLOP/s |
+| **Network** | `iperf3` (TCP)         | — (opt-in, skipped otherwise)      | up / downlink Mbit/s                        |
 
 ## JSON output
 
@@ -89,10 +95,14 @@ timestamp — handy for logging runs or feeding a dashboard:
   "timestamp": "2026-06-01T18:58:00-04:00",
   "cpu_model": "...",
   "cpu_single_eps": "...",
-  "disk_rand_read_kbps": "...",
-  "gpu_fp16_tflops": "..."
+  "disk_rand_read_mbps": "...",
+  "gpu_fp16_tflops": "...",
+  "net_down_mbps": "..."
 }
 ```
+
+When `--runs > 1`, the recorded values are the formatted summary string
+(`"mean ± stddev (n=N)"`) rather than a bare number.
 
 ## Notes
 
@@ -103,4 +113,10 @@ timestamp — handy for logging runs or feeding a dashboard:
 - **GPU section is NVIDIA-only.** It keys off `nvidia-smi`; AMD/Intel GPUs are
   skipped.
 - **Single-run noise.** Disk and memory numbers vary run-to-run. Treat a single
-  run as indicative, not definitive.
+  run as indicative, not definitive — or pass `--runs N` to average several and
+  see the spread (stddev). With the `dd` disk fallback, `--runs` averaging is
+  skipped (the test runs once); it applies to the `fio` path.
+- **Network test is opt-in.** It needs `iperf3` locally *and* a reachable
+  `iperf3 -s` server: start `iperf3 -s` on the other machine, then run
+  `./sysbench.sh --iperf-host <that-host>`. It measures uplink and downlink TCP
+  throughput separately.
