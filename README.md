@@ -1,7 +1,7 @@
-# ubuntu-benchmark
+# linux-benchmark
 
-A single, self-contained shell script that benchmarks the major subsystems of an
-Ubuntu (or any Linux) machine — **CPU, memory, disk I/O, and an optional NVIDIA
+A single, self-contained shell script that benchmarks the major subsystems of a
+Linux machine (any distribution) — **CPU, memory, disk I/O, and an optional NVIDIA
 GPU** — and prints a tidy, color-coded summary. No dependencies are *required*:
 each section uses a proper benchmarking tool when one is installed and falls back
 to a built-in approximation otherwise.
@@ -18,11 +18,16 @@ reads are more accurate if the script can drop caches — see [Notes](#notes)).
 ## Getting high-fidelity numbers
 
 The script works out of the box, but for real, comparable numbers you want the
-dedicated tools installed:
+dedicated tools installed. `--deps` prints the exact install command for your
+distro's package manager:
 
 ```bash
-sudo apt install sysbench fio
+./sysbench.sh --deps      # e.g. prints "sudo apt install sysbench fio iperf3"
 ```
+
+The package names are identical across distros, so it's just the verb that
+differs — `apt install` (Debian/Ubuntu), `dnf install` (Fedora/RHEL),
+`pacman -S` (Arch), `zypper install` (openSUSE), or `apk add` (Alpine).
 
 - **`sysbench`** drives the CPU and memory tests.
 - **`fio`** drives the disk test (4 KiB random read/write, direct I/O).
@@ -87,7 +92,7 @@ make cpu        # one section (also: mem, disk, gpu)
 make quick      # the fast sections only (cpu + mem)
 make net HOST=10.0.0.2   # network test against an iperf3 -s server
 make clean      # remove stray result/test files
-make deps       # print the apt install command
+make deps       # print the install command for your package manager
 ```
 
 Variables map onto the script's flags and are appended only when set, so unset
