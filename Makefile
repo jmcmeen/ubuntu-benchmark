@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------
-# Makefile for ubuntu-benchmark — ergonomic wrappers around ./sysbench.sh
+# Makefile for linux-benchmark — ergonomic wrappers around ./sysbench.sh
 #
 # This does not reimplement anything; it turns the script's common flag
 # combinations into short targets and maps a few make variables onto flags.
@@ -40,7 +40,7 @@ COMMON := $(RUNS_FLAG) $(JSON_FLAG) $(ARGS)
 .PHONY: help bench all cpu mem disk gpu net quick json clean deps
 
 help: ## Show this help
-	@echo 'ubuntu-benchmark — make targets:'
+	@echo 'linux-benchmark — make targets:'
 	@echo
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "} {printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -78,6 +78,6 @@ clean: ## Remove stray benchmark test/result files (current dir)
 	rm -f fio.?????? .sysbench_dd_* results.json
 	@echo 'cleaned stray fio/dd test files and results.json'
 
-deps: ## Show the apt command to install the high-fidelity tools (does NOT run it)
+deps: ## Show the install command for the high-fidelity tools (does NOT run it)
 	@echo 'These tools improve fidelity. Run this yourself (needs sudo):'
-	@echo '  sudo apt install sysbench fio iperf3'
+	@echo '  '"$$($(SCRIPT) --deps)"
