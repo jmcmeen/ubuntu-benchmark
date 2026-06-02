@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# sysbench.sh — a self-contained system benchmark for Ubuntu
+# sysbench.sh — a self-contained system benchmark for Linux
 #
 # Benchmarks CPU, memory, disk I/O, and (optionally) the GPU. Each section
 # prefers a "proper" tool (sysbench, fio, stress-ng) when installed and falls
@@ -15,6 +15,7 @@
 #   ./sysbench.sh --runs 5           # repeat each test, report mean ± stddev
 #   ./sysbench.sh --iperf-host HOST  # network test against an 'iperf3 -s' server
 #   ./sysbench.sh --json out.json    # also write machine-readable results
+#   ./sysbench.sh --deps             # print the package-install command and exit
 #   ./sysbench.sh --help
 #
 set -uo pipefail
@@ -36,6 +37,24 @@ IPERF_HOST=""              # remote 'iperf3 -s' server for the network test
 usage() {
     sed -n '2,/^set /p' "$0" | sed 's/^#\s\?//; /^set /d'
     exit 0
+}
+
+# have: is a command available? (defined early — used by --deps below as well as
+# the section functions further down).
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# detect_install_cmd: print the package-install command for the detected package
+# manager, for the package list given as args. Package names are identical across
+# distros, so only the install verb differs. Falls back to a generic hint.
+detect_install_cmd() {
+    local pkgs="$*"
+    if   have apt-get; then echo "sudo apt install $pkgs"
+    elif have dnf;     then echo "sudo dnf install $pkgs"
+    elif have pacman;  then echo "sudo pacman -S $pkgs"
+    elif have zypper;  then echo "sudo zypper install $pkgs"
+    elif have apk;     then echo "sudo apk add $pkgs"
+    else echo "install these with your package manager: $pkgs"
+    fi
 }
 
 # If any --<section> flag is passed, run *only* those sections.
@@ -61,6 +80,7 @@ while (( $# )); do
         --runs)  RUNS="${2:?--runs needs a count}"; shift ;;
         --iperf-host) IPERF_HOST="${2:?--iperf-host needs a host}"; RUN_NET=1; shift ;;
         --json)  JSON_OUT="${2:?--json needs a file}"; shift ;;
+        --deps)  detect_install_cmd sysbench fio iperf3; exit 0 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
@@ -84,7 +104,6 @@ fi
 header() { printf '\n%s%s== %s ==%s\n' "$BOLD" "$CYN" "$1" "$RST"; }
 row()    { printf '  %-26s %s\n' "$1" "${GRN}${2}${RST}"; }
 note()   { printf '  %s%s%s\n' "$DIM" "$1" "$RST"; }
-have()   { command -v "$1" >/dev/null 2>&1; }
 
 # Collected results for optional JSON output: "key\tvalue" lines.
 RESULTS=$(mktemp)
@@ -155,7 +174,12 @@ section_info() {
     cpu_model=$(lscpu 2>/dev/null | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2; exit}')
     cores=$(nproc --all 2>/dev/null || echo "?")
     threads=$(lscpu 2>/dev/null | awk -F: '/^CPU\(s\)/{gsub(/ /,"",$2); print $2; exit}')
-    mem_total=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')
+    if [[ -r /proc/meminfo ]]; then
+        mem_total=$(awk '/^MemTotal:/{printf "%.1f GiB", $2/1024/1024}' /proc/meminfo)
+    else
+        mem_total=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}' \
+                    || free 2>/dev/null | awk '/^Mem:/{print $2" kB"}')
+    fi
 
     row "Hostname"      "$(hostname)"
     row "Kernel"        "$(uname -r)"
@@ -331,8 +355,9 @@ section_disk() {
         w_line=$(dd if=/dev/zero of="$TESTFILE" bs=1M count="$DISK_SIZE_MB" \
                     oflag=direct 2>&1 || \
                  dd if=/dev/zero of="$TESTFILE" bs=1M count="$DISK_SIZE_MB" \
-                    conv=fdatasync 2>&1)
-        w_speed=$(echo "$w_line" | awk -F, 'END{gsub(/^ +/,"",$NF); print $NF}')
+                    conv=fdatasync 2>&1 || \
+                 dd if=/dev/zero of="$TESTFILE" bs=1M count="$DISK_SIZE_MB" 2>&1)
+        w_speed=$(echo "$w_line" | awk -F, '/copied|bytes|B\/s/{gsub(/^ +/,"",$NF); print $NF}')
         row "Sequential write" "${w_speed:-n/a}"
         # Drop caches if possible, then sequential read.
         sync
@@ -341,7 +366,7 @@ section_disk() {
             note "(couldn't drop caches; read figure may be cache-inflated — try sudo)"
         local r_line r_speed
         r_line=$(dd if="$TESTFILE" of=/dev/null bs=1M 2>&1)
-        r_speed=$(echo "$r_line" | awk -F, 'END{gsub(/^ +/,"",$NF); print $NF}')
+        r_speed=$(echo "$r_line" | awk -F, '/copied|bytes|B\/s/{gsub(/^ +/,"",$NF); print $NF}')
         row "Sequential read"  "${r_speed:-n/a}"
         rm -f "$TESTFILE"; TESTFILE=""
         record "disk_seq_write" "${w_speed:-}"
@@ -426,7 +451,7 @@ m_net() {
 section_net() {
     header "Network"
     if ! have iperf3; then
-        note "iperf3 not installed (sudo apt install iperf3) — skipping"
+        note "iperf3 not installed ($(detect_install_cmd iperf3)) — skipping"
         return
     fi
     if [[ -z "$IPERF_HOST" ]]; then
@@ -447,11 +472,18 @@ section_net() {
 # ----------------------------------------------------------------------------
 # JSON output
 # ----------------------------------------------------------------------------
+# iso_now: ISO-8601 timestamp, portable across GNU and BusyBox/Alpine date.
+iso_now() {
+    date -Is 2>/dev/null \
+        || date -u +%Y-%m-%dT%H:%M:%S%z 2>/dev/null \
+        || date +%Y-%m-%dT%H:%M:%S
+}
+
 write_json() {
     [[ -z "$JSON_OUT" ]] && return
     {
         echo "{"
-        echo "  \"timestamp\": \"$(date -Is)\","
+        echo "  \"timestamp\": \"$(iso_now)\","
         local first=1
         while IFS=$'\t' read -r k v; do
             [[ -z "$k" ]] && continue
@@ -474,7 +506,7 @@ write_json() {
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-printf '%s%sUbuntu System Benchmark%s  %s%s%s\n' \
+printf '%s%sLinux System Benchmark%s  %s%s%s\n' \
     "$BOLD" "$YLW" "$RST" "$DIM" "$(date '+%Y-%m-%d %H:%M:%S')" "$RST"
 
 (( RUN_INFO )) && section_info
@@ -487,4 +519,4 @@ printf '%s%sUbuntu System Benchmark%s  %s%s%s\n' \
 write_json
 header "Done"
 note "Tip: install 'sysbench fio' for higher-fidelity CPU/memory/disk numbers:"
-note "     sudo apt install sysbench fio"
+note "     $(detect_install_cmd sysbench fio)"
