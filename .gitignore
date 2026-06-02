@@ -1,0 +1,6 @@
+# Benchmark result artifacts (`make json`, `./sysbench.sh --json results.json`)
+results.json
+
+# Stray test files an interrupted disk run can leave behind
+fio.??????
+.sysbench_dd_*
