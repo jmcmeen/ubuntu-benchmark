@@ -75,6 +75,34 @@ full run instead.
 | `--json FILE`    | Also write results as JSON to `FILE`                        |
 | `-h`, `--help`   | Show usage                                                  |
 
+## Make targets
+
+A `Makefile` wraps the common flag combinations so you don't have to remember
+them. Run `make` (or `make help`) to list everything:
+
+```bash
+make            # show the target list (default)
+make bench      # full run: info, cpu, mem, disk, gpu
+make cpu        # one section (also: mem, disk, gpu)
+make quick      # the fast sections only (cpu + mem)
+make net HOST=10.0.0.2   # network test against an iperf3 -s server
+make clean      # remove stray result/test files
+make deps       # print the apt install command
+```
+
+Variables map onto the script's flags and are appended only when set, so unset
+ones fall through to the script's own defaults:
+
+```bash
+make disk DIR=/data SIZE=4096   # → --disk --dir /data --size 4096
+make bench RUNS=5 JSON=out.json # → --runs 5 --json out.json
+make cpu RUNS=10                # RUNS/JSON work on any target
+make bench ARGS=--no-gpu        # ARGS passes arbitrary extra flags
+```
+
+`DIR`, `SIZE`, `RUNS`, `HOST`, `JSON`, and `ARGS` are the recognized variables.
+`make net` errors out if `HOST` is unset.
+
 ## What each section measures
 
 | Section     | Preferred tool         | Fallback                           | Reported                                    |
